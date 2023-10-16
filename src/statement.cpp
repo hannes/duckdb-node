@@ -23,7 +23,7 @@ Napi::FunctionReference Statement::Init(Napi::Env env, Napi::Object exports) {
 	Napi::Function t =
 	    DefineClass(env, "Statement",
 	                {InstanceMethod("run", &Statement::Run), InstanceMethod("all", &Statement::All),
-	                 InstanceMethod("arrowIPCAll", &Statement::ArrowIPCAll), InstanceMethod("each", &Statement::Each),
+	                InstanceMethod("each", &Statement::Each),
 	                 InstanceMethod("finalize", &Statement::Finish), InstanceMethod("stream", &Statement::Stream),
 	                 InstanceMethod("columns", &Statement::Columns)});
 
@@ -253,7 +253,7 @@ static Napi::Value convert_chunk(Napi::Env &env, vector<std::string> names, duck
 	return scope.Escape(result);
 }
 
-enum RunType { RUN, EACH, ALL, ARROW_ALL };
+enum RunType { RUN, EACH, ALL };
 
 struct StatementParam {
 	vector<duckdb::Value> params;
@@ -274,7 +274,7 @@ struct RunPreparedTask : public Task {
 		}
 
 		result =
-		    statement.statement->Execute(params->params, run_type != RunType::ALL && run_type != RunType::ARROW_ALL);
+		    statement.statement->Execute(params->params, run_type != RunType::ALL);
 	}
 
 	void Callback() override {
@@ -345,64 +345,6 @@ struct RunPreparedTask : public Task {
 				for (duckdb::idx_t row_idx = 0; row_idx < chunk->size(); row_idx++) {
 					result_arr.Set(out_idx++, chunk_converted.Get(row_idx));
 				}
-			}
-
-			cb.MakeCallback(statement.Value(), {env.Null(), result_arr});
-		} break;
-		case RunType::ARROW_ALL: {
-			auto materialized_result = (duckdb::MaterializedQueryResult *)result.get();
-			// +1 is for null bytes at end of stream
-			Napi::Array result_arr(Napi::Array::New(env, materialized_result->RowCount() + 1));
-
-			auto deleter = [](Napi::Env, void *finalizeData, void *hint) {
-				delete static_cast<std::shared_ptr<duckdb::QueryResult> *>(hint);
-			};
-			std::shared_ptr<duckdb::QueryResult> result_ptr = std::move(result);
-
-			duckdb::idx_t out_idx = 1;
-			for (auto &chunk : materialized_result->Collection().Chunks()) {
-				if (chunk.size() == 0) {
-					continue;
-				}
-
-				D_ASSERT(chunk.ColumnCount() == 2);
-				D_ASSERT(chunk.data[0].GetType() == duckdb::LogicalType::BLOB);
-				D_ASSERT(chunk.data[1].GetType() == duckdb::LogicalType::BOOLEAN);
-
-				for (duckdb::idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-					duckdb::string_t blob = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[0])[row_idx];
-					bool is_header = chunk.data[1].GetData()[row_idx];
-
-					// Create shared pointer to give (shared) ownership to ArrayBuffer, not that for these materialized
-					// query results, the string data is owned by the QueryResult
-					auto result_ref_ptr = new std::shared_ptr<duckdb::QueryResult>(result_ptr);
-
-					auto array_buffer = Napi::Buffer<char>::NewOrCopy(env, (char *)blob.GetData(), blob.GetSize(),
-					                                                  deleter, result_ref_ptr);
-
-					auto typed_array = Napi::TypedArrayOf<char>(env, array_buffer);
-
-					// TODO we should handle this in duckdb probably
-					if (is_header) {
-						result_arr.Set((uint32_t)0, typed_array);
-					} else {
-						D_ASSERT(out_idx < materialized_result->RowCount());
-						result_arr.Set(out_idx++, typed_array);
-					}
-				}
-			}
-
-			// TODO we should handle this in duckdb probably
-			auto null_arr = Napi::Uint8Array::New(env, 4);
-			memset(null_arr.Data(), '\0', 4);
-			result_arr.Set(out_idx++, null_arr);
-
-			// Confirm all rows are set
-			if (materialized_result->RowCount() > 0) {
-				// Non empty results should have their
-				D_ASSERT(out_idx == materialized_result->RowCount() + 1);
-			} else {
-				D_ASSERT(out_idx == 2);
 			}
 
 			cb.MakeCallback(statement.Value(), {env.Null(), result_arr});
@@ -478,12 +420,6 @@ unique_ptr<StatementParam> Statement::HandleArgs(const Napi::CallbackInfo &info)
 Napi::Value Statement::All(const Napi::CallbackInfo &info) {
 	connection_ref->database_ref->Schedule(info.Env(),
 	                                       duckdb::make_uniq<RunPreparedTask>(*this, HandleArgs(info), RunType::ALL));
-	return info.This();
-}
-
-Napi::Value Statement::ArrowIPCAll(const Napi::CallbackInfo &info) {
-	connection_ref->database_ref->Schedule(
-	    info.Env(), duckdb::make_uniq<RunPreparedTask>(*this, HandleArgs(info), RunType::ARROW_ALL));
 	return info.This();
 }
 
@@ -626,8 +562,7 @@ Napi::FunctionReference QueryResult::Init(Napi::Env env, Napi::Object exports) {
 	Napi::HandleScope scope(env);
 
 	Napi::Function t = DefineClass(env, "QueryResult",
-	                               {InstanceMethod("nextChunk", &QueryResult::NextChunk),
-	                                InstanceMethod("nextIpcBuffer", &QueryResult::NextIpcBuffer)});
+	                               {InstanceMethod("nextChunk", &QueryResult::NextChunk)});
 
 	exports.Set("QueryResult", t);
 
@@ -675,47 +610,6 @@ struct GetChunkTask : public Task {
 	unique_ptr<duckdb::DataChunk> chunk;
 };
 
-struct GetNextArrowIpcTask : public Task {
-	GetNextArrowIpcTask(QueryResult &query_result, Napi::Promise::Deferred deferred)
-	    : Task(query_result), deferred(deferred) {
-	}
-
-	void DoWork() override {
-		auto &query_result = Get<QueryResult>();
-		chunk = query_result.result->Fetch();
-	}
-
-	void DoCallback() override {
-		auto &query_result = Get<QueryResult>();
-		Napi::Env env = query_result.Env();
-		Napi::HandleScope scope(env);
-
-		if (chunk == nullptr || chunk->size() == 0) {
-			deferred.Resolve(env.Null());
-			return;
-		}
-
-		// Arrow IPC streams should be a single column of a single blob
-		D_ASSERT(chunk->size() == 1 && chunk->ColumnCount() == 2);
-		D_ASSERT(chunk->data[0].GetType() == duckdb::LogicalType::BLOB);
-
-		duckdb::string_t blob = *(duckdb::string_t *)(chunk->data[0].GetData());
-
-		// Transfer ownership and Construct ArrayBuffer
-		auto data_chunk_ptr = new unique_ptr<duckdb::DataChunk>();
-		*data_chunk_ptr = std::move(chunk);
-		auto deleter = [](Napi::Env, void *finalizeData, void *hint) {
-			delete static_cast<unique_ptr<duckdb::DataChunk> *>(hint);
-		};
-		auto array_buffer =
-		    Napi::Buffer<char>::NewOrCopy(env, (char *)blob.GetData(), blob.GetSize(), deleter, data_chunk_ptr);
-
-		deferred.Resolve(array_buffer);
-	}
-
-	Napi::Promise::Deferred deferred;
-	unique_ptr<duckdb::DataChunk> chunk;
-};
 
 Napi::Value QueryResult::NextChunk(const Napi::CallbackInfo &info) {
 	auto env = info.Env();
@@ -724,15 +618,6 @@ Napi::Value QueryResult::NextChunk(const Napi::CallbackInfo &info) {
 
 	return deferred.Promise();
 }
-
-// Should only be called on an arrow ipc query
-Napi::Value QueryResult::NextIpcBuffer(const Napi::CallbackInfo &info) {
-	auto env = info.Env();
-	auto deferred = Napi::Promise::Deferred::New(env);
-	database_ref->Schedule(env, duckdb::make_uniq<GetNextArrowIpcTask>(*this, deferred));
-	return deferred.Promise();
-}
-
 Napi::Object QueryResult::NewInstance(const Napi::Object &db) {
 	return NodeDuckDB::GetData(db.Env())->query_result_constructor.New({db});
 }

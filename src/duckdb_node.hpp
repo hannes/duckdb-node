@@ -7,7 +7,6 @@
 #include <unordered_map>
 
 #include "duckdb/common/vector.hpp"
-#include "duckdb/common/arrow/arrow.hpp"
 
 using duckdb::vector;
 
@@ -108,7 +107,6 @@ public:
 	Napi::Value Parallelize(const Napi::CallbackInfo &info);
 	Napi::Value Interrupt(const Napi::CallbackInfo &info);
 	Napi::Value Close(const Napi::CallbackInfo &info);
-	Napi::Value RegisterReplacementScan(const Napi::CallbackInfo &info);
 
 public:
 	constexpr static int DUCKDB_NODEJS_ERROR = -1;
@@ -116,19 +114,13 @@ public:
 	duckdb::unique_ptr<duckdb::DuckDB> database;
 
 private:
-	// TODO this task queue can also live in the connection?
 	std::queue<duckdb::unique_ptr<Task>> task_queue;
 	std::mutex task_mutex;
 	bool task_inflight;
 	Napi::Env env;
 	int64_t bytes_allocated = 0;
-	int replacement_scan_count = 0;
 };
 
-struct JSArgs;
-void DuckDBNodeUDFLauncher(Napi::Env env, Napi::Function jsudf, std::nullptr_t *, JSArgs *data);
-
-typedef Napi::TypedThreadSafeFunction<std::nullptr_t, JSArgs, DuckDBNodeUDFLauncher> duckdb_node_udf_function_t;
 
 class Connection : public Napi::ObjectWrap<Connection> {
 public:
@@ -141,10 +133,7 @@ public:
 	Napi::Value Close(const Napi::CallbackInfo &info);
 	Napi::Value Prepare(const Napi::CallbackInfo &info);
 	Napi::Value Exec(const Napi::CallbackInfo &info);
-	Napi::Value RegisterUdf(const Napi::CallbackInfo &info);
-	Napi::Value UnregisterUdf(const Napi::CallbackInfo &info);
-	Napi::Value RegisterBuffer(const Napi::CallbackInfo &info);
-	Napi::Value UnRegisterBuffer(const Napi::CallbackInfo &info);
+
 
 	static bool HasInstance(Napi::Value val) {
 		Napi::Env env = val.Env();
@@ -160,8 +149,6 @@ public:
 public:
 	duckdb::unique_ptr<duckdb::Connection> connection;
 	Database *database_ref;
-	std::unordered_map<std::string, duckdb_node_udf_function_t> udfs;
-	std::unordered_map<std::string, Napi::Reference<Napi::Array>> array_references;
 };
 
 struct StatementParam;
@@ -178,7 +165,6 @@ public:
 public:
 	static Napi::Object NewInstance(Napi::Env env, const vector<napi_value> &args);
 	Napi::Value All(const Napi::CallbackInfo &info);
-	Napi::Value ArrowIPCAll(const Napi::CallbackInfo &info);
 	Napi::Value Each(const Napi::CallbackInfo &info);
 	Napi::Value Run(const Napi::CallbackInfo &info);
 	Napi::Value Finish(const Napi::CallbackInfo &info);
@@ -205,8 +191,6 @@ public:
 
 public:
 	Napi::Value NextChunk(const Napi::CallbackInfo &info);
-	Napi::Value NextIpcBuffer(const Napi::CallbackInfo &info);
-	duckdb::shared_ptr<ArrowSchema> cschema;
 
 private:
 	Database *database_ref;

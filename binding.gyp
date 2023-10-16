@@ -4,8 +4,7 @@
             "target_name": "<(module_name)", 
             "sources": [
                 "src/duckdb_node.cpp", 
-                "src/database.cpp", 
-                "src/data_chunk.cpp", 
+                "src/database.cpp",
                 "src/connection.cpp", 
                 "src/statement.cpp", 
                 "src/utils.cpp", 

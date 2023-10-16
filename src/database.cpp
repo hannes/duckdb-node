@@ -17,8 +17,7 @@ Napi::FunctionReference Database::Init(Napi::Env env, Napi::Object exports) {
 	    env, "Database",
 	    {InstanceMethod("close_internal", &Database::Close), InstanceMethod("wait", &Database::Wait),
 	     InstanceMethod("serialize", &Database::Serialize), InstanceMethod("parallelize", &Database::Parallelize),
-	     InstanceMethod("connect", &Database::Connect), InstanceMethod("interrupt", &Database::Interrupt),
-	     InstanceMethod("registerReplacementScan", &Database::RegisterReplacementScan)});
+	     InstanceMethod("connect", &Database::Connect), InstanceMethod("interrupt", &Database::Interrupt)});
 
 	exports.Set("Database", t);
 
@@ -260,108 +259,6 @@ Napi::Value Database::Interrupt(const Napi::CallbackInfo &info) {
 Napi::Value Database::Connect(const Napi::CallbackInfo &info) {
 	Napi::HandleScope scope(env);
 	return Connection::NewInstance(Value());
-}
-
-struct JSRSArgs {
-	std::string table = "";
-	std::string function = "";
-	vector<duckdb::Value> parameters;
-	bool done = false;
-	duckdb::PreservedError error;
-};
-
-struct NodeReplacementScanData : duckdb::ReplacementScanData {
-	NodeReplacementScanData(duckdb_node_rs_function_t rs) : rs(std::move(rs)) {};
-	duckdb_node_rs_function_t rs;
-};
-
-void DuckDBNodeRSLauncher(Napi::Env env, Napi::Function jsrs, std::nullptr_t *, JSRSArgs *jsargs) {
-	try {
-		Napi::EscapableHandleScope scope(env);
-		auto arg = Napi::String::New(env, jsargs->table);
-		auto result = jsrs({arg});
-		if (result && result.IsObject()) {
-			auto obj = result.As<Napi::Object>();
-			jsargs->function = obj.Get("function").ToString().Utf8Value();
-			auto parameters = obj.Get("parameters");
-			if (parameters.IsArray()) {
-				auto paramArray = parameters.As<Napi::Array>();
-				for (uint32_t i = 0; i < paramArray.Length(); i++) {
-					jsargs->parameters.push_back(Utils::BindParameter(paramArray.Get(i)));
-				}
-			} else {
-				throw duckdb::Exception("Expected parameter array");
-			}
-		} else if (!result.IsNull()) {
-			throw duckdb::Exception("Invalid scan replacement result");
-		}
-	} catch (const duckdb::Exception &e) {
-		jsargs->error = duckdb::PreservedError(e);
-	} catch (const std::exception &e) {
-		jsargs->error = duckdb::PreservedError(e);
-	}
-	jsargs->done = true;
-}
-
-static duckdb::unique_ptr<duckdb::TableRef>
-ScanReplacement(duckdb::ClientContext &context, const std::string &table_name, duckdb::ReplacementScanData *data) {
-	JSRSArgs jsargs;
-	jsargs.table = table_name;
-	((NodeReplacementScanData *)data)->rs.BlockingCall(&jsargs);
-	while (!jsargs.done) {
-		std::this_thread::yield();
-	}
-	if (jsargs.error) {
-		jsargs.error.Throw();
-	}
-	if (jsargs.function != "") {
-		auto table_function = duckdb::make_uniq<duckdb::TableFunctionRef>();
-		duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> children;
-		for (auto &param : jsargs.parameters) {
-			children.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(std::move(param)));
-		}
-		table_function->function = duckdb::make_uniq<duckdb::FunctionExpression>(jsargs.function, std::move(children));
-		return std::move(table_function);
-	}
-	return nullptr;
-}
-
-struct RegisterRsTask : public Task {
-	RegisterRsTask(Database &database, duckdb_node_rs_function_t rs, Napi::Promise::Deferred deferred)
-	    : Task(database), rs(std::move(rs)), deferred(deferred) {
-	}
-
-	void DoWork() override {
-		auto &database = Get<Database>();
-		if (database.database) {
-			database.database->instance->config.replacement_scans.emplace_back(
-			    ScanReplacement, duckdb::make_uniq<NodeReplacementScanData>(rs));
-		}
-	}
-
-	void DoCallback() override {
-		deferred.Resolve(deferred.Env().Undefined());
-	}
-
-	duckdb_node_rs_function_t rs;
-	Napi::Promise::Deferred deferred;
-};
-
-Napi::Value Database::RegisterReplacementScan(const Napi::CallbackInfo &info) {
-	auto env = info.Env();
-	auto deferred = Napi::Promise::Deferred::New(info.Env());
-	if (info.Length() < 1) {
-		throw Napi::TypeError::New(env, "Replacement scan callback expected");
-	}
-	Napi::Function rs_callback = info[0].As<Napi::Function>();
-	auto rs =
-	    duckdb_node_rs_function_t::New(env, rs_callback, "duckdb_node_rs_" + std::to_string(replacement_scan_count++),
-	                                   0, 1, nullptr, [](Napi::Env, void *, std::nullptr_t *ctx) {});
-	rs.Unref(env);
-
-	Schedule(info.Env(), duckdb::make_uniq<RegisterRsTask>(*this, rs, deferred));
-
-	return deferred.Promise();
 }
 
 } // namespace node_duckdb
