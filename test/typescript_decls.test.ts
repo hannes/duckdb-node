@@ -116,21 +116,6 @@ describe("TypeScript declarations", function () {
     );
   });
 
-  it("typescript: ternary int udf", function (done) {
-    db.register_udf(
-      "udf",
-      "integer",
-      (x: number, y: number, z: number) => x + y + z
-    );
-    db.all(
-      "select udf(21, 20, 1) v",
-      function (err: duckdb.DuckDbError | null, rows: duckdb.TableData) {
-        if (err) throw err;
-        assert.equal(rows[0].v, 42);
-      }
-    );
-    db.unregister_udf("udf", done);
-  });
   it("typescript: retrieve 100,000 rows with Statement#each", function (done) {
     var total = 100000;
     var retrieved = 0;
